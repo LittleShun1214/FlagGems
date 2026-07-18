@@ -8150,7 +8150,6 @@ ops:
       - special.gammaincc.out
     labels:
       - aten
-      - KernelGen
     kind:
       - Math
     stages:
