@@ -357,3 +357,84 @@ def test_igammac_log_uniform(dtype):
     with flag_gems.use_gems():
         res = torch.igammac(a, x)
     utils.gems_assert_close(res, ref, dtype, atol=1e-5)
+
+
+def _lgamma_lanczos(x):
+    """log-gamma via Lanczos (g=7, n=9) using only device-native torch
+    primitives. torch.lgamma falls back to CPU on NPU, so we inline it.
+    Kept byte-identical to benchmark/test_igammac.py so the benchmark baseline
+    is exactly what this test validates."""
+    x = x.to(torch.float32)
+    zm1 = x - 1.0
+    t = zm1 + 7.5
+    return (
+        0.5 * torch.log(torch.tensor(6.283185307179586, device=x.device))
+        + (zm1 + 0.5) * torch.log(t)
+        - t
+        + torch.log(
+            0.99999999999980993
+            + 676.5203681218851 / (zm1 + 1.0)
+            + -1259.1392167224028 / (zm1 + 2.0)
+            + 771.32342877765313 / (zm1 + 3.0)
+            + -176.61502916214059 / (zm1 + 4.0)
+            + 12.507343278686905 / (zm1 + 5.0)
+            + -0.13857109526572012 / (zm1 + 6.0)
+            + 9.9843695780195716e-6 / (zm1 + 7.0)
+            + 1.5056327351493116e-7 / (zm1 + 8.0)
+        )
+    )
+
+
+# Same iteration count as the kernel's series branch (SERIES_ITERS=50 in
+# _launch_igammac) so the comparison is fair: both sides evaluate the same
+# number of series terms (measured: 50 terms already converge on the benchmark
+# input domain, matching the 128-term result to ~4e-6).
+_SERIES_ITERS = 50
+
+
+def _igammac_composed(a, x):
+    """Device-native fixed-N power-series reference for Q(a, x)."""
+    af = a.to(torch.float32)
+    xf = x.to(torch.float32)
+    log_gamma_a = _lgamma_lanczos(af)
+    log_x_term = af * torch.log(xf) - xf - log_gamma_a
+    term = torch.ones_like(af) / af
+    series_sum = term.clone()
+    for i in range(1, _SERIES_ITERS):
+        term = term * xf / (af + i)
+        series_sum = series_sum + term
+    q = 1.0 - torch.exp(log_x_term) * series_sum
+    return torch.clamp(q, 0.0, 1.0)
+
+
+@pytest.mark.igammac
+@pytest.mark.parametrize("shape", [(4096,), (64, 64), (10000, 256)])
+def test_igammac_composed_baseline_matches_torch(shape):
+    """Validate the benchmark's composed 50-term power-series baseline against
+    torch.special.gammaincc over the benchmark input domain (a, x in
+    [0.1, 10.1]). On backends without a native torch.igammac kernel (e.g.
+    ascend, where torch falls back to CPU and the AI Core baseline is composed
+    from device-native primitives instead) the benchmark times the gems kernel
+    against this reference; this test proves the reference itself is correct,
+    so the benchmark comparison is meaningful."""
+    torch.manual_seed(0)
+    a = torch.rand(shape, dtype=torch.float32, device=flag_gems.device) * 10 + 0.1
+    x = torch.rand(shape, dtype=torch.float32, device=flag_gems.device) * 10 + 0.1
+    res = _igammac_composed(a, x)
+    ref = torch.special.gammaincc(a.double().cpu(), x.double().cpu())
+    err = (res.double().cpu() - ref).abs().max().item()
+    assert err < 1e-4, f"composed baseline off by {err:.2e}"
+    assert int(torch.isnan(res).sum()) == 0
+    # domain corners on a small grid
+    grid_v = torch.tensor(
+        [0.1, 0.5, 5.0, 9.9, 10.0, 10.1],
+        dtype=torch.float32,
+        device=flag_gems.device,
+    )
+    ga, gx = torch.meshgrid(grid_v, grid_v, indexing="ij")
+    ga = ga.reshape(-1)
+    gx = gx.reshape(-1)
+    res_g = _igammac_composed(ga, gx)
+    ref_g = torch.special.gammaincc(ga.double().cpu(), gx.double().cpu())
+    err_g = (res_g.double().cpu() - ref_g).abs().max().item()
+    assert err_g < 1e-4, f"composed grid corner off by {err_g:.2e}"
